@@ -1,0 +1,296 @@
+import type { ModelMessage } from "ai";
+import {
+  isToolResultPart,
+  textToolResultOutput,
+  toolResultOutputToText,
+} from "./tool-result-output.js";
+
+export class TokenTracker {
+  private lastPreciseCount: number | null = null;
+  private pendingChars = 0;
+
+  constructor(private readonly contextWindowTokens: number) {}
+
+  updateFromAPI(promptTokens: number): void {
+    this.lastPreciseCount = promptTokens;
+    this.pendingChars = 0;
+  }
+
+  addMessage(message: ModelMessage): void {
+    this.pendingChars += countMessageChars(message);
+  }
+
+  addMessages(messages: ModelMessage[]): void {
+    for (const message of messages) {
+      this.addMessage(message);
+    }
+  }
+
+  replaceMessages(before: ModelMessage[], after: ModelMessage[]): void {
+    this.pendingChars += countMessagesChars(after) - countMessagesChars(before);
+  }
+
+  get estimatedTokens(): number {
+    return Math.max(0, (this.lastPreciseCount ?? 0) + Math.ceil(this.pendingChars / 4));
+  }
+
+  get measurement(): TokenMeasurement {
+    return {
+      observedPromptTokens: this.lastPreciseCount,
+      pendingEstimatedTokens: Math.ceil(this.pendingChars / 4),
+    };
+  }
+
+  get status(): { tokens: number; percent: number; needsAction: boolean } {
+    const tokens = this.estimatedTokens;
+    const percent = Math.round((tokens / this.contextWindowTokens) * 100);
+    return { tokens, percent, needsAction: percent >= 75 };
+  }
+}
+
+export interface TokenMeasurement {
+  observedPromptTokens: number | null;
+  pendingEstimatedTokens: number;
+}
+
+function countMessageChars(message: ModelMessage): number {
+  let chars = 0;
+  if (typeof message.content === "string") {
+    return message.content.length;
+  }
+  if (!Array.isArray(message.content)) return chars;
+
+  for (const part of message.content) {
+    if ("text" in part && typeof part.text === "string") {
+      chars += part.text.length;
+    } else if ("output" in part) {
+      chars += toolResultOutputToText(part.output).length;
+    } else if ("input" in part) {
+      chars += JSON.stringify(part.input)?.length ?? 0;
+    }
+  }
+  return chars;
+}
+
+function countMessagesChars(messages: ModelMessage[]): number {
+  let chars = 0;
+  for (const message of messages) {
+    chars += countMessageChars(message);
+  }
+  return chars;
+}
+
+export function estimateMessageTokens(messages: ModelMessage[]): number {
+  const chars = countMessagesChars(messages);
+  return Math.ceil((chars / 4) * 1.2);
+}
+
+interface TruncationConfig {
+  maxSingleResult: number;
+  contextBudgetChars: number;
+}
+
+function createTruncationConfig(contextWindowTokens: number): TruncationConfig {
+  return {
+    maxSingleResult: Math.floor(contextWindowTokens * 0.5 * 2),
+    contextBudgetChars: Math.floor(contextWindowTokens * 0.75 * 4),
+  };
+}
+
+export function truncateToolResults(
+  messages: ModelMessage[],
+  contextWindowTokens: number,
+  config: TruncationConfig = createTruncationConfig(contextWindowTokens),
+): { messages: ModelMessage[]; truncated: number; compacted: number } {
+  let truncated = 0;
+  let compacted = 0;
+
+  const result = messages.map((msg) => {
+    if (msg.role !== "tool") return msg;
+
+    const newContent = msg.content.map((part) => {
+      if (!isToolResultPart(part)) return part;
+      const outputText = toolResultOutputToText(part.output);
+      if (outputText.length <= config.maxSingleResult) return part;
+
+      truncated++;
+      const maxChars = config.maxSingleResult;
+      const headSize = Math.floor(maxChars * 0.6);
+      const tailSize = Math.floor(maxChars * 0.4);
+      const head = outputText.slice(0, headSize);
+      const tail = outputText.slice(-tailSize);
+
+      return {
+        ...part,
+        output: textToolResultOutput(
+          `${head}\n\n[truncated: ${outputText.length} → ${maxChars} chars]\n\n${tail}`,
+        ),
+      };
+    });
+
+    return { ...msg, content: newContent };
+  });
+
+  let totalChars = result.reduce((sum, msg) => {
+    if (typeof msg.content === "string") return sum + msg.content.length;
+    if (Array.isArray(msg.content)) {
+      return (
+        sum +
+        msg.content.reduce((partSum, part) => {
+          if ("output" in part) {
+            return partSum + toolResultOutputToText(part.output).length;
+          }
+          return partSum + ("text" in part && typeof part.text === "string" ? part.text.length : 0);
+        }, 0)
+      );
+    }
+    return sum;
+  }, 0);
+
+  if (totalChars > config.contextBudgetChars) {
+    for (let i = 0; i < result.length && totalChars > config.contextBudgetChars; i++) {
+      const msg = result[i];
+      if (!msg) continue;
+      if (msg.role !== "tool") continue;
+      const toolName = msg.content.find(isToolResultPart)?.toolName ?? "unknown";
+      const oldSize = msg.content.reduce(
+        (sum, part) =>
+          sum + (isToolResultPart(part) ? toolResultOutputToText(part.output).length : 0),
+        0,
+      );
+      result[i] = {
+        ...msg,
+        content: msg.content.map((part) =>
+          isToolResultPart(part)
+            ? {
+                ...part,
+                output: textToolResultOutput(
+                  `[compacted: ${toolName} output removed to free context]`,
+                ),
+              }
+            : part,
+        ),
+      };
+      totalChars -= oldSize;
+      compacted++;
+    }
+  }
+
+  return { messages: result, truncated, compacted };
+}
+
+interface TTLConfig {
+  softTTLMs: number;
+  hardTTLMs: number;
+  keepHeadTail: number;
+}
+
+const DEFAULT_TTL: TTLConfig = {
+  softTTLMs: 5 * 60 * 1000,
+  hardTTLMs: 10 * 60 * 1000,
+  keepHeadTail: 1500,
+};
+
+export interface PruneResult {
+  messages: ModelMessage[];
+  softPruned: number;
+  hardPruned: number;
+}
+
+export function ttlPrune(
+  messages: ModelMessage[],
+  timestamps: Map<number, number>,
+  config: TTLConfig = DEFAULT_TTL,
+): PruneResult {
+  const now = Date.now();
+  let softPruned = 0;
+  let hardPruned = 0;
+
+  const result = messages.map((msg, idx) => {
+    if (msg.role !== "tool") return msg;
+
+    const ts = timestamps.get(idx);
+    if (!ts) return msg;
+
+    const age = now - ts;
+
+    const outputText = msg.content
+      .map((part) => (isToolResultPart(part) ? toolResultOutputToText(part.output) : ""))
+      .join("");
+    const isError = /error|失败|不存在|denied|refused|timeout/i.test(outputText);
+    if (isError) return msg;
+
+    if (age >= config.hardTTLMs) {
+      hardPruned++;
+      const toolName = msg.content.find(isToolResultPart)?.toolName ?? "unknown";
+      return {
+        ...msg,
+        content: msg.content.map((part) =>
+          isToolResultPart(part)
+            ? {
+                ...part,
+                output: textToolResultOutput(`[tool result expired: ${toolName}]`),
+              }
+            : part,
+        ),
+      };
+    }
+
+    if (age >= config.softTTLMs) {
+      const newContent = msg.content.map((part) => {
+        if (!isToolResultPart(part)) return part;
+        const outputText = toolResultOutputToText(part.output);
+        if (outputText.length <= config.keepHeadTail * 2) return part;
+
+        softPruned++;
+        const head = outputText.slice(0, config.keepHeadTail);
+        const tail = outputText.slice(-config.keepHeadTail);
+        const removed = outputText.length - config.keepHeadTail * 2;
+
+        return {
+          ...part,
+          output: textToolResultOutput(
+            `${head}\n\n[soft pruned: ${removed} chars removed, content older than ${Math.round(config.softTTLMs / 60000)}min]\n\n${tail}`,
+          ),
+        };
+      });
+      return { ...msg, content: newContent };
+    }
+
+    return msg;
+  });
+
+  return { messages: result, softPruned, hardPruned };
+}
+
+export interface DefenseResult {
+  messages: ModelMessage[];
+  tokenEstimate: number;
+  truncated: number;
+  compacted: number;
+  softPruned: number;
+  hardPruned: number;
+}
+
+export function applyDefense(
+  messages: ModelMessage[],
+  timestamps: Map<number, number>,
+  contextWindowTokens: number,
+): DefenseResult {
+  const trunc = truncateToolResults(messages, contextWindowTokens);
+  let result = trunc.messages;
+
+  const prune = ttlPrune(result, timestamps);
+  result = prune.messages;
+
+  const tokenEstimate = estimateMessageTokens(result);
+
+  return {
+    messages: result,
+    tokenEstimate,
+    truncated: trunc.truncated,
+    compacted: trunc.compacted,
+    softPruned: prune.softPruned,
+    hardPruned: prune.hardPruned,
+  };
+}
