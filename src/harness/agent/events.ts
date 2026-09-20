@@ -18,6 +18,10 @@ export interface AgentLoopResult {
 }
 
 export type AgentEvent =
+  | {
+      type: "guardrail_checked";
+      audit: import("../guardrails/index.js").GuardrailAudit;
+    }
   | { type: "run_started"; maxSteps: number }
   | { type: "step_started"; step: number }
   | { type: "text_delta"; step: number; text: string }

@@ -77,6 +77,7 @@ export const agentEventTypeSchema = z.enum([
   "loop_detected",
   "retry_scheduled",
   "cache_usage",
+  "guardrail_checked",
   "text_delta",
   "run_finished",
   "run_failed",

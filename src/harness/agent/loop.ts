@@ -6,7 +6,11 @@ import {
   streamText,
 } from "ai";
 import type { LocalTraceRecorder } from "../trace/recorder.js";
-import { normalizeUsage, type StepUsage, type UsageRecorder } from "../usage/tracker.js";
+import {
+  normalizeUsage,
+  type StepUsage,
+  type UsageRecorder,
+} from "../usage/tracker.js";
 import type {
   AgentEventSink,
   AgentLoopResult,
@@ -17,16 +21,27 @@ import { ToolLoopDetector } from "./loop-detection.js";
 import { calculateDelay, isRetryable, sleep } from "./retry.js";
 import type { AgentToolRuntime, AgentToolSelection } from "./tool-runtime.js";
 
+import type { AgentGuardrails } from "../guardrails/index.js";
+import { runGuardedLoop } from "../guardrails/runner.js";
+
 const MAX_STEPS = 50;
 const MAX_RETRIES = 3;
 
 export interface AgentLoopOptions {
+  guardrails?: AgentGuardrails;
   model: LanguageModel;
   toolRuntime: AgentToolRuntime;
   toolSelection?: AgentToolSelection;
   messages: ModelMessage[];
   system: string;
   tracker?: UsageRecorder;
+  /** Run-local context compaction only. Must not persist or publish candidate content. */
+  prepareNextStep?: (
+    messages: ModelMessage[],
+    usage: StepUsage,
+    responseMessages: ModelMessage[],
+    needsFollowUp: boolean,
+  ) => void | Promise<void>;
   onStepUsage?: (
     usage: StepUsage,
     responseMessages: ModelMessage[],
@@ -40,6 +55,12 @@ export interface AgentLoopOptions {
   forceFinalStep?: boolean;
 }
 
+export function agentLoop(options: AgentLoopOptions): Promise<AgentLoopResult> {
+  return options.guardrails
+    ? runGuardedLoop(options, runAgentLoopCore)
+    : runAgentLoopCore(options);
+}
+
 const EMPTY_USAGE: StepUsage = {
   inputTokens: 0,
   outputTokens: 0,
@@ -47,7 +68,7 @@ const EMPTY_USAGE: StepUsage = {
   cacheWriteTokens: 0,
 };
 
-export async function agentLoop({
+async function runAgentLoopCore({
   model,
   toolRuntime,
   toolSelection,
@@ -55,6 +76,7 @@ export async function agentLoop({
   system,
   tracker,
   onStepUsage,
+  prepareNextStep,
   trace,
   eventSink,
   maxSteps = MAX_STEPS,
@@ -79,12 +101,14 @@ export async function agentLoop({
 
   try {
     while (step < maxSteps) {
+      abortSignal?.throwIfAborted();
       step++;
       const isLastStep = forceFinalStep && step === maxSteps;
       if (isLastStep) {
         const finalInstruction: ModelMessage = {
           role: "user",
-          content: "你已经收集了足够的信息。请直接输出文字总结，不要再调用任何工具。",
+          content:
+            "你已经收集了足够的信息。请直接输出文字总结，不要再调用任何工具。",
         };
         messages.push(finalInstruction);
         appendedMessages.push(finalInstruction);
@@ -131,7 +155,10 @@ export async function agentLoop({
                   input: part.input,
                 });
 
-                const detection = loopDetector.detect(part.toolName, part.input);
+                const detection = loopDetector.detect(
+                  part.toolName,
+                  part.input,
+                );
                 if (detection.stuck) {
                   await emit({
                     type: "loop_detected",
@@ -156,7 +183,9 @@ export async function agentLoop({
 
               case "tool-result": {
                 const output =
-                  typeof part.output === "string" ? part.output : JSON.stringify(part.output);
+                  typeof part.output === "string"
+                    ? part.output
+                    : JSON.stringify(part.output);
                 await emit({
                   type: "tool_finished",
                   step,
@@ -179,11 +208,13 @@ export async function agentLoop({
             }
           }
 
+          abortSignal?.throwIfAborted();
           const finalStep = await result.finalStep;
           stepResponse = finalStep.response;
           stepUsage = await result.usage;
           break;
         } catch (error) {
+          abortSignal?.throwIfAborted();
           await trace?.recordAttemptError(step, attempt, error);
           if (attempt > maxRetries || !isRetryable(error)) throw error;
           const delay = calculateDelay(attempt);
@@ -209,7 +240,9 @@ export async function agentLoop({
       }
 
       if (!stepResponse || !stepUsage) {
-        throw new Error("Model step completed without response metadata or usage");
+        throw new Error(
+          "Model step completed without response metadata or usage",
+        );
       }
 
       const responseMessages = stepResponse.messages;
@@ -229,6 +262,12 @@ export async function agentLoop({
         usage: normalizedUsage,
       });
       const stepRecord = tracker?.record(modelId, normalizedUsage);
+      await prepareNextStep?.(
+        messages,
+        normalizedUsage,
+        responseMessages,
+        hasToolCall,
+      );
       await onStepUsage?.(normalizedUsage, responseMessages, hasToolCall);
 
       if (

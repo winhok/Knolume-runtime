@@ -1,6 +1,9 @@
 import type { LanguageModel, ModelMessage } from "ai";
 import { type AgentEvent, agentLoop } from "../agent/loop.js";
-import type { AgentToolRuntime, AgentToolSelection } from "../agent/tool-runtime.js";
+import type {
+  AgentToolRuntime,
+  AgentToolSelection,
+} from "../agent/tool-runtime.js";
 import { LocalTraceRecorder } from "../trace/recorder.js";
 import type { UsageRecorder } from "../usage/tracker.js";
 import { resolveSubAgentProfile } from "./profiles.js";
@@ -8,6 +11,7 @@ import type { SubAgentRegistry } from "./registry.js";
 import type { SpawnRequest, SubAgentProfile } from "./types.js";
 
 export interface SpawnContext {
+  guardrails?: import("../guardrails/index.js").AgentGuardrails;
   model: LanguageModel;
   createToolRuntime: (agentId: string) => AgentToolRuntime;
   agentRegistry: SubAgentRegistry;
@@ -25,7 +29,13 @@ export interface SpawnContext {
 
 const MAX_STEPS = 30;
 
-const AGENT_COLORS = ["\x1b[36m", "\x1b[33m", "\x1b[35m", "\x1b[32m", "\x1b[34m"];
+const AGENT_COLORS = [
+  "\x1b[36m",
+  "\x1b[33m",
+  "\x1b[35m",
+  "\x1b[32m",
+  "\x1b[34m",
+];
 const RESET = "\x1b[0m";
 
 function agentTag(index: number, runId: string): string {
@@ -92,15 +102,22 @@ export async function spawnAgent(
     startedAt: new Date().toISOString(),
   });
 
-  const timeout = request.timeout || ctx.agentRegistry.getConfig().defaultTimeout;
+  const timeout =
+    request.timeout || ctx.agentRegistry.getConfig().defaultTimeout;
   const controller = new AbortController();
   const abortFromParent = () => controller.abort(ctx.abortSignal?.reason);
   if (ctx.abortSignal?.aborted) abortFromParent();
-  else ctx.abortSignal?.addEventListener("abort", abortFromParent, { once: true });
+  else
+    ctx.abortSignal?.addEventListener("abort", abortFromParent, { once: true });
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
-    controller.abort(new DOMException(`Sub-agent timed out after ${timeout}ms`, "TimeoutError"));
+    controller.abort(
+      new DOMException(
+        `Sub-agent timed out after ${timeout}ms`,
+        "TimeoutError",
+      ),
+    );
   }, timeout);
   const toolRuntime = ctx.createToolRuntime(runId);
   let partialText = "";
@@ -116,13 +133,17 @@ export async function spawnAgent(
         partialText += event.text;
         break;
       case "tool_started":
-        console.log(`  ${tag} 调用 ${event.tool}(${JSON.stringify(event.input).slice(0, 80)})`);
+        console.log(
+          `  ${tag} 调用 ${event.tool}(${JSON.stringify(event.input).slice(0, 80)})`,
+        );
         break;
       case "loop_detected":
         console.log(`  ${tag} ${event.message}`);
         break;
       case "retry_scheduled":
-        console.log(`  ${tag} 模型调用重试 ${event.attempt}/${event.maxRetries}`);
+        console.log(
+          `  ${tag} 模型调用重试 ${event.attempt}/${event.maxRetries}`,
+        );
         break;
     }
   };
@@ -140,6 +161,7 @@ export async function spawnAgent(
       `  ${tag} 启动 [${resolved.name}${parallel ? ", 并行只读" : ""}]: ${request.task.slice(0, 50)}`,
     );
     const result = await agentLoop({
+      guardrails: ctx.guardrails,
       model: ctx.model,
       toolRuntime,
       toolSelection: resolved.selection,
@@ -169,8 +191,10 @@ export async function spawnAgent(
     return output;
   } catch (error) {
     const isAbort =
-      (error instanceof Error && error.name === "AbortError") || controller.signal.aborted;
-    const parentCancelled = isAbort && !timedOut && ctx.abortSignal?.aborted === true;
+      (error instanceof Error && error.name === "AbortError") ||
+      controller.signal.aborted;
+    const parentCancelled =
+      isAbort && !timedOut && ctx.abortSignal?.aborted === true;
     const errorMessage = parentCancelled
       ? "父 Run 已取消"
       : isAbort
