@@ -33,7 +33,7 @@ The example uses a deterministic model and makes no API calls. It demonstrates t
 The initial release distributes a built package as a GitHub Release asset; it is not published to the npm registry.
 
 ```sh
-pnpm add https://github.com/winhok/Knolume-runtime/releases/download/v0.1.1/knolume-runtime-0.1.1.tgz
+pnpm add https://github.com/winhok/Knolume-runtime/releases/download/v0.3.0/knolume-runtime-0.3.0.tgz
 ```
 
 ```ts
