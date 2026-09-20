@@ -1,6 +1,6 @@
 {
   "name": "@knolume/runtime",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Composable agent runtime with tool policies, memory, RAG, skills and sub-agents.",
   "type": "module",
   "license": "MIT",

@@ -37,9 +37,9 @@ pnpm add https://github.com/winhok/Knolume-runtime/releases/download/v0.1.1/knol
 ```
 
 ```ts
-import { agentLoop, type AgentToolRuntime } from '@knolume/runtime';
-import { ToolRegistry, ToolExecutionPipeline } from '@knolume/runtime/tools';
-import { createAgentRunRequestSchema } from '@knolume/runtime/protocol';
+import { agentLoop, type AgentToolRuntime } from "@knolume/runtime";
+import { ToolRegistry, ToolExecutionPipeline } from "@knolume/runtime/tools";
+import { createAgentRunRequestSchema } from "@knolume/runtime/protocol";
 ```
 
 Pass an AI SDK `LanguageModel` and an `AgentToolRuntime` to `agentLoop`. The host implements `getTools(selection)` and must enforce authorization and approval when executing tools. See [the runnable example](examples/basic-agent.mjs) and [loop tests](src/harness/agent/loop.spec.ts) for the complete options and tool-call flow.
@@ -75,24 +75,36 @@ boundaries; your application owns the rules, identity context, prompts and model
 import { agentLoop, GuardrailError } from "@knolume/runtime";
 
 const result = await agentLoop({
-  model, toolRuntime, messages, system,
+  model,
+  toolRuntime,
+  messages,
+  system,
   guardrails: {
     inputMode: "parallel", // "blocking" checks before starting inference
     context: trustedContext,
-    input: [{
-      name: "request-policy",
-      timeoutMs: 10_000,
-      execute: async ({ text, messages, context, signal }) => {
-        const verdict = await classifyRequest({ text, messages, context, signal });
-        return { tripwireTriggered: verdict.blocked };
+    input: [
+      {
+        name: "request-policy",
+        timeoutMs: 10_000,
+        execute: async ({ text, messages, context, signal }) => {
+          const verdict = await classifyRequest({
+            text,
+            messages,
+            context,
+            signal,
+          });
+          return { tripwireTriggered: verdict.blocked };
+        },
       },
-    }],
-    output: [{
-      name: "response-policy",
-      execute: ({ text, messages }) => ({
-        tripwireTriggered: violatesPolicy(text, messages),
-      }),
-    }],
+    ],
+    output: [
+      {
+        name: "response-policy",
+        execute: ({ text, messages }) => ({
+          tripwireTriggered: violatesPolicy(text, messages),
+        }),
+      },
+    ],
   },
 });
 ```
@@ -132,3 +144,15 @@ Tool output checks happen after tool execution; they protect model context and
 content delivery, not earlier side effects. Keep resource permissions, approvals,
 network restrictions and sandbox enforcement in the host. Omitting `guardrails`
 preserves the original streaming behavior.
+
+### Guardrail governance and output recovery (0.3)
+
+`GuardrailScheduler` bounds host-shared classifier concurrency and queue size. Pass the checker signal to `scheduler.run(signal, operation)`. Queued cancellation removes the waiter; active work retains its slot until it actually settles, even if a caller times out. An exhausted queue throws; Enforce remains fail-closed and Shadow records the error.
+
+`evaluateGuardrailCorpus`, `loadGuardrailCorpus`, `validatePromotionReport` and `validatePromotionEvidence` provide report generation and validation. The host chooses categories, false-block threshold and required external evidence. Reports bind policy version, corpus, classifier configuration and exact report bytes; validators recalculate metrics and reject duplicate sample IDs. Runtime cancellation/effect counters must come from observed execution, never invented values. A fixture classifier is not provider evidence.
+
+Audit entries optionally include `policyVersion`, SHA-256 `requestHash`, `durationMs` and measured `addedTokens`. These contain no candidate text or classifier error. The host persists and aggregates them using its own event journal.
+
+Output rules are mandatory unless explicitly marked `reviewable: true`. A decision may additionally return `reviewable: false` for high-risk content. Mandatory failures and timeout/error/invalid results never enter recovery. An optional `repairOutput({text, rule, requestHash, signal})` gets one attempt, followed by full revalidation. An optional `reviewOutput(...)` returns a boolean for that exact candidate and one rule. Other rules still run; review cannot disable the policy. Recovery has a bounded `recoveryTimeoutMs` (default five minutes). The host must bind review identity, expiry and one-time consumption. Recovery discards the rejected transcript and deferred content callbacks; only the accepted final assistant text is replayed. Real tool side effects performed before an output block are not rolled back.
+
+`SkillLoader.createView()` captures frozen copies of skill definitions. Use the same `SkillView` for prompt construction, skill invocation and child-agent tools throughout a Run. Reloading the loader cannot change a running view.

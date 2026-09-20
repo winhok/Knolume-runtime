@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ModelMessage } from "ai";
 
 export type GuardrailStage = "input" | "output" | "tool_input" | "tool_output";
@@ -15,6 +16,10 @@ export interface GuardrailAudit {
   name: string;
   mode: "enforce" | "shadow";
   outcome: GuardrailOutcome;
+  policyVersion?: string;
+  requestHash?: string;
+  durationMs?: number;
+  addedTokens?: number;
 }
 export interface GuardrailInput {
   stage: GuardrailStage;
@@ -28,13 +33,30 @@ export interface Guardrail {
   name: string;
   mode?: "enforce" | "shadow";
   timeoutMs?: number;
+  /** Only explicit non-mandatory output rules can be repaired/reviewed. */
+  reviewable?: boolean;
   execute: (
     args: GuardrailInput & { context: unknown; signal: AbortSignal },
   ) =>
-    | { tripwireTriggered: boolean }
-    | PromiseLike<{ tripwireTriggered: boolean }>;
+    | { tripwireTriggered: boolean; reviewable?: boolean; addedTokens?: number }
+    | PromiseLike<{
+        tripwireTriggered: boolean;
+        reviewable?: boolean;
+        addedTokens?: number;
+      }>;
 }
+export interface OutputRecoveryInput {
+  text: string;
+  rule: string;
+  requestHash: string;
+  signal: AbortSignal;
+}
+
 export interface AgentGuardrails {
+  policyVersion?: string;
+  repairOutput?: (input: OutputRecoveryInput) => Promise<string>;
+  reviewOutput?: (input: OutputRecoveryInput) => Promise<boolean>;
+  recoveryTimeoutMs?: number;
   input?: readonly Guardrail[];
   output?: readonly Guardrail[];
   toolInput?: readonly Guardrail[];
@@ -51,6 +73,8 @@ export class GuardrailError extends Error {
   constructor(
     readonly stage: GuardrailStage,
     readonly outcome: GuardrailFailure,
+    readonly ruleName?: string,
+    readonly canReview = false,
   ) {
     super(`Guardrail ${stage}: ${outcome}`);
   }
@@ -89,6 +113,7 @@ export async function checkGuardrails(
     const timeoutMs = rule.timeoutMs ?? config.timeoutMs ?? 10_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0)
       throw new GuardrailError(value.stage, "invalid");
+    const startedAt = performance.now();
     const controller = new AbortController();
     const combined = AbortSignal.any([signal, controller.signal]);
     const timer = setTimeout(
@@ -96,6 +121,8 @@ export async function checkGuardrails(
       timeoutMs,
     );
     let outcome: GuardrailOutcome;
+    let canReview = false;
+    let addedTokens: number | undefined;
     try {
       const result = await abortable(
         Promise.resolve().then(() =>
@@ -107,7 +134,15 @@ export async function checkGuardrails(
         ),
         combined,
       );
-      if (!result || typeof result.tripwireTriggered !== "boolean")
+      if (Number.isSafeInteger(result?.addedTokens) && result.addedTokens! >= 0)
+        addedTokens = result.addedTokens;
+      canReview = rule.reviewable === true && result?.reviewable !== false;
+      if (
+        !result ||
+        typeof result.tripwireTriggered !== "boolean" ||
+        (result.reviewable !== undefined &&
+          typeof result.reviewable !== "boolean")
+      )
         outcome = "invalid";
       else outcome = result.tripwireTriggered ? "blocked" : "passed";
     } catch {
@@ -119,13 +154,27 @@ export async function checkGuardrails(
     const mode = rule.mode ?? "enforce";
     await audit({
       stage: value.stage,
-      name: rule.name,
+      ...(addedTokens !== undefined ? { addedTokens } : {}),
+      name: /^[a-zA-Z0-9_.:-]{1,100}$/.test(rule.name)
+        ? rule.name
+        : "host-rule",
+      ...(config.policyVersion
+        ? {
+            policyVersion: /^[a-zA-Z0-9_.:-]{1,100}$/.test(config.policyVersion)
+              ? config.policyVersion
+              : "host-policy",
+          }
+        : {}),
+      requestHash: createHash("sha256")
+        .update(JSON.stringify(value))
+        .digest("hex"),
+      durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
       mode,
       outcome:
         mode === "shadow" && outcome === "blocked" ? "would_block" : outcome,
     });
     signal.throwIfAborted();
     if (outcome !== "passed" && mode === "enforce")
-      throw new GuardrailError(value.stage, outcome);
+      throw new GuardrailError(value.stage, outcome, rule.name, canReview);
   }
 }

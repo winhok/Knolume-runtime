@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ToolSet } from "ai";
 import type { AgentLoopOptions } from "../agent/loop.js";
 import type { AgentEvent, AgentLoopResult } from "../agent/events.js";
@@ -14,6 +15,9 @@ export async function runGuardedLoop(
   core: (options: AgentLoopOptions) => Promise<AgentLoopResult>,
 ): Promise<AgentLoopResult> {
   const config = options.guardrails!;
+  const outputNames = (config.output ?? []).map((rule) => rule.name);
+  if (new Set(outputNames).size !== outputNames.length)
+    throw new GuardrailError("output", "invalid");
   const controller = new AbortController();
   const signal = AbortSignal.any([
     controller.signal,
@@ -215,18 +219,151 @@ export async function runGuardedLoop(
       },
     });
     void running.catch(() => {});
-    const [result] = await Promise.all([abortable(running, signal), input]);
+    let [result] = await Promise.all([abortable(running, signal), input]);
     signal.throwIfAborted();
     if (failure) throw failure;
     const text = events
       .filter((event) => event.type === "text_delta")
       .map((event) => event.text)
       .join("");
-    await check(config.output, {
-      stage: "output",
+    const outputValue = {
+      stage: "output" as const,
       messages: result.appendedMessages,
       text: text || result.text,
-    });
+    };
+    const outputAudit = (entry: import("./index.js").GuardrailAudit) =>
+      audit({ type: "guardrail_checked", audit: entry });
+    // Mandatory rules run first and can never enter recovery.
+    await check(
+      config.output?.filter((rule) => !rule.reviewable),
+      outputValue,
+    );
+    const reviewable = config.output?.filter((rule) => rule.reviewable);
+    let recovered = false;
+    try {
+      await checkGuardrails(
+        reviewable,
+        outputValue,
+        config,
+        signal,
+        outputAudit,
+      );
+    } catch (error) {
+      if (
+        !(error instanceof GuardrailError) ||
+        error.outcome !== "blocked" ||
+        !error.canReview
+      )
+        throw error;
+      const timeout = config.recoveryTimeoutMs ?? 300_000;
+      if (!Number.isSafeInteger(timeout) || timeout <= 0)
+        throw new GuardrailError("output", "invalid");
+      const recoveryController = new AbortController();
+      const recoverySignal = AbortSignal.any([
+        signal,
+        recoveryController.signal,
+      ]);
+      const timer = setTimeout(
+        () => recoveryController.abort(new GuardrailError("output", "timeout")),
+        timeout,
+      );
+      const recoveryInput = () => ({
+        text: outputValue.text,
+        rule: error.ruleName!,
+        requestHash: createHash("sha256")
+          .update(outputValue.text)
+          .digest("hex"),
+        signal: recoverySignal,
+      });
+      try {
+        let remaining = error;
+        if (config.repairOutput) {
+          let repaired: string;
+          try {
+            repaired = await abortable(
+              config.repairOutput(recoveryInput()),
+              recoverySignal,
+            );
+          } catch {
+            signal.throwIfAborted();
+            throw new GuardrailError(
+              "output",
+              recoverySignal.aborted ? "timeout" : "error",
+            );
+          }
+          if (typeof repaired !== "string" || !repaired.trim())
+            throw new GuardrailError("output", "invalid");
+          reserve(repaired);
+          outputValue.text = repaired;
+          outputValue.messages = [{ role: "assistant", content: repaired }];
+          // Full revalidation, mandatory checks included.
+          await check(
+            config.output?.filter((rule) => !rule.reviewable),
+            outputValue,
+          );
+          try {
+            await checkGuardrails(
+              reviewable,
+              outputValue,
+              config,
+              recoverySignal,
+              outputAudit,
+            );
+            recovered = true;
+          } catch (next) {
+            if (
+              !(next instanceof GuardrailError) ||
+              next.outcome !== "blocked" ||
+              !next.canReview
+            )
+              throw next;
+            remaining = next;
+          }
+        }
+        if (!recovered) {
+          if (!config.reviewOutput || remaining.ruleName !== error.ruleName)
+            throw remaining;
+          let approved: boolean;
+          try {
+            approved = await abortable(
+              config.reviewOutput(recoveryInput()),
+              recoverySignal,
+            );
+          } catch {
+            signal.throwIfAborted();
+            throw new GuardrailError(
+              "output",
+              recoverySignal.aborted ? "timeout" : "error",
+            );
+          }
+          if (approved !== true) throw remaining;
+          // Approval is only for this one rule and this candidate, never a policy switch.
+          await check(
+            config.output?.filter(
+              (rule) => !(rule.reviewable && rule.name === remaining.ruleName),
+            ),
+            outputValue,
+          );
+          recovered = true;
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    if (recovered) {
+      result = {
+        ...result,
+        text: outputValue.text,
+        appendedMessages: [{ role: "assistant", content: outputValue.text }],
+      };
+      // Do not replay callbacks/events carrying the rejected candidate or tool transcript.
+      callbacks.length = 0;
+      events.length = 0;
+      events.push(
+        { type: "text_delta", step: result.stats.steps, text: result.text },
+        { type: "run_finished", result },
+      );
+    }
     signal.throwIfAborted();
     // Replay persistence only after every configured check has passed.
     for (const callback of callbacks) {

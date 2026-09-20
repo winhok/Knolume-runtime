@@ -11,6 +11,64 @@ export interface SkillDefinition {
   dirPath: string;
 }
 
+export class SkillView {
+  private readonly skills: ReadonlyMap<string, SkillDefinition>;
+
+  constructor(skills: Iterable<SkillDefinition>) {
+    this.skills = new Map(
+      Array.from(
+        skills,
+        (skill) => [skill.name, Object.freeze({ ...skill })] as const,
+      ),
+    );
+  }
+
+  list(): SkillDefinition[] {
+    return Array.from(this.skills.values());
+  }
+
+  get(name: string): SkillDefinition | undefined {
+    return this.skills.get(name);
+  }
+
+  listUserInvocable(): SkillDefinition[] {
+    return this.list().filter((skill) => skill.userInvocable);
+  }
+
+  listModelInvocable(): SkillDefinition[] {
+    return this.list().filter((skill) => !skill.disableModelInvocation);
+  }
+
+  buildSkillContent(skill: SkillDefinition, args = ""): string {
+    let content = [
+      `Skill 目录: ${skill.dirPath}`,
+      "",
+      skill.content.replaceAll(SKILL_DIR_PLACEHOLDER, skill.dirPath),
+    ].join("\n");
+
+    const instruction = args.trim();
+    if (!instruction) return content;
+    if (content.includes("$ARGUMENTS")) {
+      return content.replaceAll("$ARGUMENTS", instruction);
+    }
+    content += `\n\n用户指令: ${instruction}`;
+    return content;
+  }
+
+  buildPromptSection(): string | null {
+    const available = this.listModelInvocable().map((skill) => {
+      const hint = skill.whenToUse ? ` (适用场景: ${skill.whenToUse})` : "";
+      return `  ${skill.name} — ${skill.description}${hint}`;
+    });
+
+    if (available.length === 0) return null;
+    return [
+      "可用的 Skills（匹配用户任务时，先调用 skill 工具加载）：",
+      ...available,
+    ].join("\n");
+  }
+}
+
 const SKILLS_DIR = ".skills";
 const SKILL_FILE = "SKILL.md";
 const SKILL_DIR_PLACEHOLDER = "$" + "{SKILL_DIR}";
@@ -21,6 +79,10 @@ export class SkillLoader {
 
   constructor(baseDir = ".") {
     this.baseDir = baseDir;
+  }
+
+  createView(): SkillView {
+    return new SkillView(this.list());
   }
 
   private get skillsDir(): string {
@@ -72,31 +134,11 @@ export class SkillLoader {
   }
 
   buildSkillContent(skill: SkillDefinition, args = ""): string {
-    let content = [
-      `Skill 目录: ${skill.dirPath}`,
-      "",
-      skill.content.replaceAll(SKILL_DIR_PLACEHOLDER, skill.dirPath),
-    ].join("\n");
-
-    const instruction = args.trim();
-    if (!instruction) return content;
-    if (content.includes("$ARGUMENTS")) {
-      return content.replaceAll("$ARGUMENTS", instruction);
-    }
-    content += `\n\n用户指令: ${instruction}`;
-    return content;
+    return this.createView().buildSkillContent(skill, args);
   }
 
   buildPromptSection(): string | null {
-    if (this.skills.size === 0) return null;
-
-    const available = this.listModelInvocable().map((skill) => {
-      const hint = skill.whenToUse ? ` (适用场景: ${skill.whenToUse})` : "";
-      return `  ${skill.name} — ${skill.description}${hint}`;
-    });
-
-    if (available.length === 0) return null;
-    return ["可用的 Skills（匹配用户任务时，先调用 skill 工具加载）：", ...available].join("\n");
+    return this.createView().buildPromptSection();
   }
 
   private parseFrontmatter(raw: string): {
@@ -146,7 +188,10 @@ export class SkillLoader {
     const whenToUse = meta.when_to_use;
     return {
       description: meta.description || "",
-      disableModelInvocation: parseBoolean(meta["disable-model-invocation"], false),
+      disableModelInvocation: parseBoolean(
+        meta["disable-model-invocation"],
+        false,
+      ),
       userInvocable: parseBoolean(meta["user-invocable"], true),
       content: body.trim(),
       ...(whenToUse ? { whenToUse } : {}),

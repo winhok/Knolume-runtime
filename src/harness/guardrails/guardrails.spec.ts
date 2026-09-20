@@ -296,6 +296,8 @@ describe("guarded agent loop", () => {
     expect(s.events).toContainEqual({
       type: "guardrail_checked",
       audit: {
+        durationMs: expect.any(Number),
+        requestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
         stage: "input",
         name: "test",
         mode: "shadow",
@@ -359,5 +361,113 @@ describe("guarded agent loop", () => {
       () => {},
     );
     expect(messages[0]?.content).toBe("original");
+  });
+});
+
+describe("output recovery", () => {
+  const advisory: Guardrail = {
+    name: "advisory",
+    reviewable: true,
+    execute: ({ text }) => ({
+      tripwireTriggered: text.includes("candidate-secret"),
+    }),
+  };
+  it("repairs once, rechecks, and never replays rejected text", async () => {
+    const repairOutput = vi.fn(async () => "safe answer");
+    const s = setup({ output: [advisory], repairOutput });
+    const result = await agentLoop(s.options);
+    expect(result.text).toBe("safe answer");
+    expect(repairOutput).toHaveBeenCalledTimes(1);
+    expect(
+      JSON.stringify([
+        s.events,
+        s.messages,
+        s.trace.recordStepCompleted.mock.calls,
+      ]),
+    ).not.toContain("candidate-secret");
+  });
+  it("never repairs or reviews a mandatory or high-risk block", async () => {
+    for (const output of [
+      [rule(true)],
+      [
+        {
+          ...advisory,
+          execute: () => ({ tripwireTriggered: true, reviewable: false }),
+        },
+      ],
+    ]) {
+      const repairOutput = vi.fn(async () => "safe");
+      const reviewOutput = vi.fn(async () => true);
+      const s = setup({ output, repairOutput, reviewOutput });
+      await expect(agentLoop(s.options)).rejects.toMatchObject({
+        outcome: "blocked",
+      });
+      expect(repairOutput).not.toHaveBeenCalled();
+      expect(reviewOutput).not.toHaveBeenCalled();
+    }
+  });
+  it("rechecks mandatory rules against repaired content", async () => {
+    const s = setup({
+      output: [
+        {
+          name: "mandatory",
+          execute: ({ text }) => ({ tripwireTriggered: text === "new-secret" }),
+        },
+        advisory,
+      ],
+      repairOutput: async () => "new-secret",
+      reviewOutput: async () => true,
+    });
+    await expect(agentLoop(s.options)).rejects.toMatchObject({
+      outcome: "blocked",
+    });
+    expect(s.messages).toHaveLength(1);
+    expect(JSON.stringify(s.events)).not.toContain("new-secret");
+  });
+  it("binds review to candidate hash, consumes only approval and bounds waiting", async () => {
+    const reviewOutput = vi.fn(
+      async (_input: import("./index.js").OutputRecoveryInput) => true,
+    );
+    const s = setup({ output: [advisory], reviewOutput });
+    expect((await agentLoop(s.options)).text).toBe("candidate-secret");
+    expect(reviewOutput.mock.calls[0]?.[0]).toMatchObject({
+      requestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      rule: "advisory",
+    });
+    const blocked = setup({
+      output: [advisory],
+      reviewOutput: async () => new Promise(() => {}),
+      recoveryTimeoutMs: 10,
+    });
+    await expect(agentLoop(blocked.options)).rejects.toMatchObject({
+      outcome: "timeout",
+    });
+    expect(blocked.messages).toHaveLength(1);
+  });
+});
+
+it("rejects ambiguous review rule names and malformed review eligibility", async () => {
+  const duplicate = setup({
+    output: [
+      rule(true, { reviewable: true }),
+      rule(true, { reviewable: true }),
+    ],
+    reviewOutput: async () => true,
+  });
+  await expect(agentLoop(duplicate.options)).rejects.toMatchObject({
+    outcome: "invalid",
+  });
+  const malformed = setup({
+    output: [
+      rule(true, {
+        reviewable: true,
+        execute: () =>
+          ({ tripwireTriggered: true, reviewable: "false" }) as never,
+      }),
+    ],
+    reviewOutput: async () => true,
+  });
+  await expect(agentLoop(malformed.options)).rejects.toMatchObject({
+    outcome: "invalid",
   });
 });

@@ -34,3 +34,6 @@ export * from "./trace/recorder.js";
 export * from "./usage/tracker.js";
 export * from "./usage/persistent-recorder.js";
 export * from "./guardrails/index.js";
+
+export * from "./guardrails/evaluation.js";
+export * from "./guardrails/scheduler.js";
