@@ -44,9 +44,14 @@ export function createDashScopeEmbedder(apiKey: string): EmbeddingFn {
   });
 }
 
-const embedCache = new Map<string, number[]>();
+const embedCaches = new WeakMap<EmbeddingFn, Map<string, number[]>>();
 
 export async function embed(fn: EmbeddingFn, texts: string[]): Promise<number[][]> {
+  let embedCache = embedCaches.get(fn);
+  if (!embedCache) {
+    embedCache = new Map<string, number[]>();
+    embedCaches.set(fn, embedCache);
+  }
   const results = new Array<number[]>(texts.length);
   const uncached: { idx: number; text: string }[] = [];
 

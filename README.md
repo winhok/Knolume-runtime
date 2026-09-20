@@ -1,21 +1,32 @@
 # Knolume Runtime
 
-A TypeScript agent runtime for applications that own their prompts, identity, tools and execution policies. Licensed under MIT.
+English | [简体中文](README.zh-CN.md)
 
-## Capabilities
+A composable TypeScript agent runtime for model execution, tools, context, memory, retrieval, guardrails, and sub-agents. Applications supply their own models, prompts, tools, and policies through the `@knolume/runtime` library.
 
-- Agent loop with streaming events, retries, cancellation and loop detection.
-- Tool registry, capability filtering, approval callbacks and execution hooks.
-- Memory, SQLite-backed sessions, retrieval, context compression and prompt assembly.
-- Skills loading, sub-agent coordination, trace and usage records.
-- MCP tool adapters and generic tool discovery. Product tools are supplied by the host.
-- Zod schemas for run, event, tool, approval and workspace transport contracts.
+For Node.js applications that need control over tool permissions, context lifecycle, and execution records. Compose the modules you need while keeping product decisions in the host.
 
-This repository provides a library. The host supplies the model, authentication, authorization, product configuration, tool implementations and any HTTP/SSE transport. Product applications and domain logic are maintained separately.
+[Quick start](#run-locally) · [Integration](#use-in-an-application) · [Verification](#verification) · [Guardrails](docs/guardrails.md)
 
-## Quick start
+## Core capabilities
 
-Requires Node.js 26 and pnpm 11. Native SQLite dependencies may need a local C/C++ build toolchain when a prebuilt binary is unavailable.
+| Capability | Implementation |
+| --- | --- |
+| Agent loop, streaming events, retries, cancellation, and loop detection | [`src/harness/agent/`](src/harness/agent/) |
+| Tool registration, execution, capability filtering, permissions, approvals, and hooks | [`src/tools/`](src/tools/) |
+| MCP tool contracts and adapters (host-provided client) | [`src/tools/mcp/`](src/tools/mcp/) |
+| Prompt assembly, project rules, compression, and context limits | [`src/harness/context/`](src/harness/context/) |
+| Memory storage, search, and validation | [`src/harness/memory/`](src/harness/memory/) |
+| Document chunking, embeddings, SQLite vector search, and retrieval | [`src/harness/rag/`](src/harness/rag/) |
+| Input, tool, and output guardrails; evaluation and recovery | [`src/harness/guardrails/`](src/harness/guardrails/) |
+| Skill loading and frozen per-run views | [`src/harness/skills/`](src/harness/skills/) |
+| Sub-agent profiles, dispatch, and run tracking | [`src/harness/agents/`](src/harness/agents/) |
+| Session persistence, traces, and usage records | [`session/`](src/harness/session/), [`trace/`](src/harness/trace/), [`usage/`](src/harness/usage/) |
+| Run, tool, approval, workspace, and transfer schemas | [`src/protocol/`](src/protocol/) |
+
+## Run locally
+
+Use Node.js 26 and pnpm 12.5.1, as specified in [`package.json`](package.json). Native SQLite dependencies may require a C/C++ build toolchain when no prebuilt binary is available.
 
 ```sh
 git clone https://github.com/winhok/Knolume-runtime.git
@@ -23,18 +34,24 @@ cd Knolume-runtime
 pnpm install --frozen-lockfile
 pnpm build
 pnpm example
-pnpm test
 ```
 
-The example uses a deterministic model and makes no API calls. It demonstrates the actual agent loop and event stream; it is not evidence of a live model integration.
+The [example](examples/basic-agent.mjs) runs the agent loop with a deterministic model and requires no credentials or network calls. It prints:
+
+```text
+Hello from Knolume Runtime!
+run_started → step_started → text_delta → step_finished → run_finished
+```
 
 ## Use in an application
 
-The initial release distributes a built package as a GitHub Release asset; it is not published to the npm registry.
+Install a versioned package asset from [GitHub Releases](https://github.com/winhok/Knolume-runtime/releases). For `v0.4.0`:
 
 ```sh
-pnpm add https://github.com/winhok/Knolume-runtime/releases/download/v0.3.0/knolume-runtime-0.3.0.tgz
+pnpm add https://github.com/winhok/Knolume-runtime/releases/download/v0.4.0/knolume-runtime-0.4.0.tgz
 ```
+
+The package has three main entry points:
 
 ```ts
 import { agentLoop, type AgentToolRuntime } from "@knolume/runtime";
@@ -42,117 +59,74 @@ import { ToolRegistry, ToolExecutionPipeline } from "@knolume/runtime/tools";
 import { createAgentRunRequestSchema } from "@knolume/runtime/protocol";
 ```
 
-Pass an AI SDK `LanguageModel` and an `AgentToolRuntime` to `agentLoop`. The host implements `getTools(selection)` and must enforce authorization and approval when executing tools. See [the runnable example](examples/basic-agent.mjs) and [loop tests](src/harness/agent/loop.spec.ts) for the complete options and tool-call flow.
+Pass an AI SDK `LanguageModel`, messages, a system prompt, and an `AgentToolRuntime` to `agentLoop`. The tool runtime implements `getTools(selection)`; the application supplies tool implementations and permission/approval policy. See the [runnable example](examples/basic-agent.mjs) and [agent-loop tests](src/harness/agent/loop.spec.ts) for integration examples.
 
-## Boundaries
+The host also owns tenant isolation, credentials, data retention, storage access, and sandbox/network restrictions. Protocol schemas describe requests and events; the host implements the server and durable job lifecycle.
 
-- Run/event schemas define a protocol; they do not start a server or persist a durable job queue.
-- Host policy determines which tools are registered and what each run may access.
-- File, shell, search and Git tool implementations, input schemas and command policies belong to private products. None are bundled here. The host supplies `permissionPolicy` to the execution pipeline; the runtime enforces its allow/ask/deny result and approval flow.
-- Memory, traces and session stores can contain user content. The host owns tenant isolation, retention and storage permissions.
-- Model and embedding credentials are provided by the host, never by this package.
+### Guardrails
 
-## Development and releases
+Optional `guardrails` check input, tool input/output, and generated output. The runtime provides scheduling, cancellation, buffering, audit events, and recovery hooks; the host supplies rules, trusted context, and checker models.
+
+Guarded execution buffers content until checks pass. Shadow mode records outcomes without enforcement. Output checks cannot undo tool side effects, so resource permissions and approval remain part of the host's tool execution policy.
+
+See [Guardrails](docs/guardrails.md) for configuration, execution guarantees, evaluation, output recovery, and child-run propagation.
+
+### Embedding caches
+
+Embedding caches are isolated by embedding-function identity. Reuse a function for cache hits; create a new function when changing models or configuration.
+
+## Verification
 
 ```sh
 pnpm typecheck
 pnpm test
+pnpm test:coverage
 pnpm build
 pnpm example
 pnpm pack
 ```
 
-Source changes belong here. Consumers pin a release asset and commit their lockfile. Release assets contain compiled code and declarations; Git history contains source and tests. Keep previous artifacts available so consumers can roll back their dependency and lockfile together.
+Coverage uses V8 and includes all production `src/**/*.ts` files, including files not imported by tests, while excluding `*.spec.ts`. Open `coverage/index.html` for details or read `coverage/coverage-summary.json`. Generated reports are ignored by Git.
 
-Third-party dependencies retain their own licenses. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The 2026-09-21 local snapshot has **151 passing tests across 40 files**:
 
-## Guardrails
+| Metric | Coverage |
+| --- | ---: |
+| Statements | 79.27% |
+| Branches | 69.97% |
+| Functions | 84.95% |
+| Lines | 82.15% |
 
-`agentLoop` accepts host-owned `guardrails`. Runtime provides scheduling and execution
-boundaries; your application owns the rules, identity context, prompts and models.
+Tests cover session recovery, trace redaction and write failures, usage accounting, retrieval diversity, embedding failures/cache isolation, and context truncation/expiry. Remaining gaps include sub-agent orchestration, context views, SQLite search branches, and transport schemas.
 
-```ts
-import { agentLoop, GuardrailError } from "@knolume/runtime";
+Tests use temporary local files/databases, deterministic models, and mocked HTTP. These results do not verify live providers, retrieval quality, current provider prices, or production deployment. Rerun coverage after code changes.
 
-const result = await agentLoop({
-  model,
-  toolRuntime,
-  messages,
-  system,
-  guardrails: {
-    inputMode: "parallel", // "blocking" checks before starting inference
-    context: trustedContext,
-    input: [
-      {
-        name: "request-policy",
-        timeoutMs: 10_000,
-        execute: async ({ text, messages, context, signal }) => {
-          const verdict = await classifyRequest({
-            text,
-            messages,
-            context,
-            signal,
-          });
-          return { tripwireTriggered: verdict.blocked };
-        },
-      },
-    ],
-    output: [
-      {
-        name: "response-policy",
-        execute: ({ text, messages }) => ({
-          tripwireTriggered: violatesPolicy(text, messages),
-        }),
-      },
-    ],
-  },
-});
+## Relationship to coding-agent
+
+Knolume Runtime carries forward the reusable core extracted from [coding-agent](https://github.com/winhok/coding-agent), previously named Runframe. Core runtime development continues here; the archived repository preserves the coding application and its CLI, Feishu, and scheduled-task integrations.
+
+In the historical application, [`src/index.ts`](https://github.com/winhok/coding-agent/blob/main/src/index.ts) starts the CLI, while [`src/main.ts`](https://github.com/winhok/coding-agent/blob/main/src/main.ts) assembles models, tools, configuration, Feishu, and Cron.
+
+This package exposes runtime APIs and transport schemas. Your application owns the entry points, authentication, HTTP/SSE transport, product configuration, and concrete file, shell, Git, or business tools. Migrating from coding-agent requires adapting those integrations and checking persisted data formats; the two repositories are not interchangeable packages.
+
+## Development
+
+Develop runtime changes here and pin a versioned release asset in consuming applications. Commit the consumer lockfile and retain older assets for rollback. `pnpm pack` builds the package before creating the archive.
+
+For AI SDK integration work, the optional [official Vercel skill](https://github.com/vercel/ai/tree/main/skills/use-ai-sdk) covers streaming, tools, messages, and usage. A one-off v6-to-v7 migration review can use:
+
+```sh
+npx skills use vercel/ai@migrate-ai-sdk-v6-to-v7
 ```
 
-The example's model, tools, classifier and policy functions are host dependencies.
-Checks can call another model or `agentLoop`; do not recursively attach the same
-semantic checker to its own classifier. Missing or malformed decisions are errors,
-never an implicit pass. `toolInput` and `toolOutput` use the same interface with
-`tool`, `input` and `output` fields. These wrap SDK tools; authoritative authorization
-and validation of hook-modified arguments must remain in the tool execution pipeline.
+The runtime already uses AI SDK 7; ordinary v7 patch upgrades do not require this migration skill. Contributor skills are development aids, not runtime dependencies.
 
-- Parallel input checks allow speculative inference, but gate tool execution and
-  SDK input callbacks. Rejection cancels the shared signal. Tokens may be consumed.
-- Guarded runs buffer content events, trace content and `onStepUsage` callbacks until
-  all checks pass. Output checks receive all emitted text and appended messages,
-  including intermediate steps. This mode delays streaming until validation finishes.
-- Only temporary messages are used during guarded execution. Rejected candidates
-  do not reach the caller's history, content callbacks, event sink or trace.
-  `prepareNextStep` is a trusted, run-local compaction hook: never publish or persist
-  from it. Usage accounting can record consumed tokens even for rejected requests.
-- Each check defaults to enforcement and a 10-second deadline. `mode: "shadow"`
-  records would-block/errors/timeouts without enforcing. Shadow is not protection.
-- `guardrail_checked` events contain only name, stage, mode and outcome. The rule
-  names and context must come from trusted configuration. Checker errors/decisions
-  are not copied into audit events. `GuardrailError` distinguishes blocked, invalid,
-  timeout, error, buffer_limit, unsupported_tool and cancellation_incomplete.
-- Buffering defaults to 2,000,000 serialized characters across content events and
-  deferred callbacks. `maxBufferChars` controls this bound. Cancellation waits at
-  most `cancellationTimeoutMs` (default 2 seconds) for model/tool work to settle.
-  A tool ignoring cancellation may still finish its side effect; no rollback is claimed.
-- Provider-executed tools are rejected for guarded runs because local gates cannot
-  control them. Async iterable tools return only their final checked result.
-- Set `SpawnContext.guardrails` to the parent's host-owned configuration to apply
-  the same checks to child runs. Child requests cannot disable those checks.
+## Help and contributions
 
-Tool output checks happen after tool execution; they protect model context and
-content delivery, not earlier side effects. Keep resource permissions, approvals,
-network restrictions and sandbox enforcement in the host. Omitting `guardrails`
-preserves the original streaming behavior.
+Use [Issues](https://github.com/winhok/Knolume-runtime/issues) for bug reports and feature requests. Include a minimal reproduction, Node.js/pnpm/package versions, and relevant errors; remove credentials and user data.
 
-### Guardrail governance and output recovery (0.3)
+Focused pull requests are welcome. Add tests for behavior changes, keep English and Chinese documentation aligned for API changes, and run the verification commands above. Maintained by [winhok](https://github.com/winhok).
 
-`GuardrailScheduler` bounds host-shared classifier concurrency and queue size. Pass the checker signal to `scheduler.run(signal, operation)`. Queued cancellation removes the waiter; active work retains its slot until it actually settles, even if a caller times out. An exhausted queue throws; Enforce remains fail-closed and Shadow records the error.
+## License
 
-`evaluateGuardrailCorpus`, `loadGuardrailCorpus`, `validatePromotionReport` and `validatePromotionEvidence` provide report generation and validation. The host chooses categories, false-block threshold and required external evidence. Reports bind policy version, corpus, classifier configuration and exact report bytes; validators recalculate metrics and reject duplicate sample IDs. Runtime cancellation/effect counters must come from observed execution, never invented values. A fixture classifier is not provider evidence.
-
-Audit entries optionally include `policyVersion`, SHA-256 `requestHash`, `durationMs` and measured `addedTokens`. These contain no candidate text or classifier error. The host persists and aggregates them using its own event journal.
-
-Output rules are mandatory unless explicitly marked `reviewable: true`. A decision may additionally return `reviewable: false` for high-risk content. Mandatory failures and timeout/error/invalid results never enter recovery. An optional `repairOutput({text, rule, requestHash, signal})` gets one attempt, followed by full revalidation. An optional `reviewOutput(...)` returns a boolean for that exact candidate and one rule. Other rules still run; review cannot disable the policy. Recovery has a bounded `recoveryTimeoutMs` (default five minutes). The host must bind review identity, expiry and one-time consumption. Recovery discards the rejected transcript and deferred content callbacks; only the accepted final assistant text is replayed. Real tool side effects performed before an output block are not rolled back.
-
-`SkillLoader.createView()` captures frozen copies of skill definitions. Use the same `SkillView` for prompt construction, skill invocation and child-agent tools throughout a Run. Reloading the loader cannot change a running view.
+[MIT](LICENSE). Third-party dependencies retain their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
